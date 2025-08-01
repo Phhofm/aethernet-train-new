@@ -1,18 +1,8 @@
 #!/usr/bin/env python3
 """
 AetherNet Model Release Script
-==============================
 
-Converts trained AetherNet models to optimized deployment formats with:
-- Robustness across PyTorch versions (1.10+)
-- Comprehensive error handling and validation
-- Cross-platform compatibility (Windows/Linux/macOS)
-- Framework-specific optimizations (TensorRT/DML/ONNX Runtime)
-- Memory-efficient processing
-
-Output Formats:
-- PyTorch: FP32 (fused), FP16 (fused), INT8 (quantized)
-- ONNX: FP32, FP16, INT8 (with framework metadata)
+Converts trained AetherNet models to optimized deployment formats using the modular architecture.
 """
 
 import argparse
@@ -25,15 +15,22 @@ import platform
 import traceback
 from pathlib import Path
 from copy import deepcopy
-from typing import Dict, Tuple, Optional, Callable, Any, List
+from typing import Callable, Any, List, Optional  # Fixed: Added Optional import
 
 import torch
 import numpy as np
 from PIL import Image
 import onnxruntime as ort
 
-# Import from core implementation
-from aether_core import AetherNet, export_onnx, parse_version
+# Import from modular implementation
+from aethernet_arch import AetherNet
+from aethernet_utils import (
+    export_onnx, 
+    parse_version, 
+    stabilize_for_fp16,
+    save_optimized,
+    load_optimized
+)
 
 # ------------------- Environment Configuration ------------------- 
 # Suppress benign warnings
@@ -48,8 +45,6 @@ IS_MAC = platform.system() == "Darwin"
 IS_LINUX = platform.system() == "Linux"
 HAS_CUDA = torch.cuda.is_available()
 HAS_DML = "DmlExecutionProvider" in ort.get_available_providers()
-PT_VERSION = parse_version(torch.__version__)
-MIN_PT_VERSION = parse_version("1.10.0")
 
 # ------------------- Constants & Configuration ------------------- 
 MAX_RETRIES = 3
@@ -82,7 +77,18 @@ logger = logging.getLogger("AetherNetRelease")
 
 # ------------------- Helper Functions ------------------- 
 def load_image(image_path: Path) -> torch.Tensor:
-    """Load an image and convert to normalized tensor (CxHxW, [0,1])."""
+    """
+    Load an image and convert to normalized tensor (CxHxW, [0,1]).
+    
+    Args:
+        image_path: Path to image file
+        
+    Returns:
+        Normalized torch.Tensor of shape (1, 3, H, W)
+        
+    Raises:
+        IOError: If image loading fails
+    """
     try:
         img = Image.open(image_path).convert('RGB')
         img_np = np.array(img, dtype=np.float32) / 255.0
@@ -90,17 +96,28 @@ def load_image(image_path: Path) -> torch.Tensor:
     except Exception as e:
         raise IOError(f"Failed to load image {image_path}: {str(e)}")
 
+
 def validate_pytorch_model(
     model: torch.nn.Module,
     validation_data: torch.Tensor,
     device: torch.device
 ) -> bool:
-    """Validate model produces finite outputs with correct shape."""
+    """
+    Validate model produces finite outputs with correct shape.
+    
+    Args:
+        model: Model to validate
+        validation_data: Input tensor for validation
+        device: Device to run validation on
+        
+    Returns:
+        True if validation succeeds, False otherwise
+    """
     try:
         model.eval()
         model.to(device)
         
-        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.float16 if next(model.parameters()).dtype == torch.float16 else torch.float32):
+        with torch.no_grad():
             input_tensor = validation_data.to(device)
             # Match input dtype to model dtype
             if next(model.parameters()).dtype == torch.float16:
@@ -113,16 +130,25 @@ def validate_pytorch_model(
             return True
     except Exception as e:
         logger.error(f"PyTorch validation FAILED: {str(e)}")
-        logger.debug(traceback.format_exc())
         return False
+
 
 def validate_onnx_model(
     onnx_path: Path, validation_data: torch.Tensor, scale: int
 ) -> bool:
-    """Validate ONNX model produces finite outputs with correct shape."""
-    providers = ['CUDAExecutionProvider', 'DmlExecutionProvider', 'CPUExecutionProvider']
+    """
+    Validate ONNX model produces finite outputs with correct shape.
+    
+    Args:
+        onnx_path: Path to ONNX model
+        validation_data: Input tensor for validation
+        scale: Super-resolution scale factor
+        
+    Returns:
+        True if validation succeeds, False otherwise
+    """
     try:
-        session = ort.InferenceSession(str(onnx_path), providers=providers)
+        session = ort.InferenceSession(str(onnx_path), providers=SUPPORTED_ONNX_PROVIDERS)
         input_name = session.get_inputs()[0].name
         input_type = session.get_inputs()[0].type
         
@@ -143,11 +169,29 @@ def validate_onnx_model(
         return True
     except Exception as e:
         logger.error(f"ONNX validation FAILED: {str(e)}")
-        logger.debug(traceback.format_exc())
         return False
 
-def attempt_operation(operation: Callable, validation: Callable[[Any], bool], success_msg: str, error_msg: str, max_retries: int = MAX_RETRIES) -> Any:
-    """Execute operation with retries and validation checks."""
+
+def attempt_operation(
+    operation: Callable, 
+    validation: Callable[[Any], bool], 
+    success_msg: str, 
+    error_msg: str, 
+    max_retries: int = MAX_RETRIES
+) -> Any:
+    """
+    Execute operation with retries and validation checks.
+    
+    Args:
+        operation: Function to execute
+        validation: Function to validate result
+        success_msg: Message for successful operation
+        error_msg: Message for failed operation
+        max_retries: Maximum number of retries
+        
+    Returns:
+        Result of operation if successful, None otherwise
+    """
     for attempt in range(1, max_retries + 1):
         try:
             logger.info(f"Attempt {attempt}/{max_retries}")
@@ -158,7 +202,7 @@ def attempt_operation(operation: Callable, validation: Callable[[Any], bool], su
             else:
                 logger.warning(f"Validation failed on attempt {attempt}")
         except Exception as e:
-            logger.error(f"Operation failed: {str(e)}")
+            logger.error(f"Operation failed on attempt {attempt}: {str(e)}")
             logger.debug(traceback.format_exc())
             time.sleep(1)
     logger.error(f"❌ {error_msg}")
@@ -170,16 +214,27 @@ def memory_cleanup():
     if HAS_CUDA:
         torch.cuda.empty_cache()
 
+
 # ------------------- Model Conversion Functions ------------------- 
 def create_fp32_model(
     base_model: AetherNet,
     validation_sample: torch.Tensor,
     device: torch.device
 ) -> Optional[AetherNet]:
-    """Create clean fused FP32 model from base model."""
+    """
+    Create clean fused FP32 model from base model.
+    
+    Args:
+        base_model: Original model instance
+        validation_sample: Sample for validation
+        device: Device for validation
+        
+    Returns:
+        Fused FP32 model if successful, None otherwise
+    """
     def _operation():
         # Create fresh model instance to ensure clean state
-        model = AetherNet(**base_model.arch_config)
+        model = AetherNet(**base_model.get_config())
         # Load state dict ignoring quantization parameters
         model.load_state_dict(base_model.state_dict(), strict=False)
         model.fuse_model()
@@ -193,16 +248,27 @@ def create_fp32_model(
         error_msg="Failed to create FP32 model"
     )
 
+
 def create_fp16_model(
     fp32_model: AetherNet,
     validation_sample: torch.Tensor,
     device: torch.device
 ) -> Optional[AetherNet]:
-    """Convert FP32 model to stable FP16 format."""
+    """
+    Convert FP32 model to stable FP16 format.
+    
+    Args:
+        fp32_model: Fused FP32 model
+        validation_sample: Sample for validation
+        device: Device for validation
+        
+    Returns:
+        FP16 model if successful, None otherwise
+    """
     def _operation():
         model = deepcopy(fp32_model)
         # Apply FP16 stabilization before conversion
-        model.stabilize_for_fp16()
+        stabilize_for_fp16(model)
         model = model.half()
         model.eval()
         return model
@@ -214,25 +280,30 @@ def create_fp16_model(
         error_msg="Failed to create FP16 model"
     )
 
+
 def create_int8_model(
     base_qat_model: AetherNet,
     validation_sample: torch.Tensor,
     device: torch.device
 ) -> Optional[AetherNet]:
-    """Convert QAT model to final INT8 quantized model."""
+    """
+    Convert QAT model to final INT8 quantized model.
+    
+    Args:
+        base_qat_model: QAT-prepared model
+        validation_sample: Sample for validation
+        device: Device for validation
+        
+    Returns:
+        INT8 model if successful, None otherwise
+    """
     def _operation():
-        # Select appropriate quantization backend
-        backend = 'fbgemm' if platform.system() == 'Linux' else 'qnnpack'
-        if backend not in torch.backends.quantized.supported_engines:
-            backend = torch.backends.quantized.supported_engines[0]
-        
-        torch.backends.quantized.engine = backend
-        logger.info(f"Using quantization backend: {backend}")
-        
         # Convert on CPU for stability
         model_to_convert = deepcopy(base_qat_model).cpu().eval()
         int8_model = model_to_convert.convert_to_quantized()
-        int8_model.verify_quantization()
+            
+        if not int8_model.verify_quantization():
+            raise RuntimeError("Quantization verification failed")
         return int8_model
             
     # Validate on CPU where conversion happens
@@ -244,9 +315,16 @@ def create_int8_model(
         error_msg="Failed to create INT8 model"
     )
 
-def export_onnx_wrapper(model, scale, precision, output_path, validation_sample):
-    """Export model to ONNX format and validate output."""
+
+def export_onnx_wrapper(
+    model: AetherNet, 
+    scale: int, 
+    precision: str, 
+    output_path: Path, 
+    validation_sample: torch.Tensor
+) -> Optional[Path]:
     def _operation():
+            
         export_onnx(deepcopy(model), scale, precision, str(output_path))
         return output_path
 
@@ -257,39 +335,61 @@ def export_onnx_wrapper(model, scale, precision, output_path, validation_sample)
         error_msg=f"Failed to export {precision.upper()} ONNX model"
     )
 
-def load_checkpoint(model_path: Path) -> Tuple[Dict, Dict, int, bool]:
-    """Load model checkpoint and extract architecture configuration."""
-    checkpoint = torch.load(model_path, map_location='cpu')
-    state_dict = checkpoint.get('params_ema', checkpoint.get('params', checkpoint.get('state_dict', checkpoint)))
-    
-    if not isinstance(state_dict, dict):
-        raise ValueError("Could not find a valid state_dict in the checkpoint.")
 
-    arch_config = checkpoint.get('arch_config', None)
+def load_checkpoint(model_path: Path) -> tuple:
+    """
+    Load model checkpoint and extract architecture configuration.
     
-    is_qat_checkpoint = any('fake_quant' in k or 'activation_post_process' in k for k in state_dict.keys())
-    if is_qat_checkpoint:
-        logger.info("QAT checkpoint detected based on state_dict keys.")
+    Args:
+        model_path: Path to model checkpoint
+        
+    Returns:
+        (state_dict, arch_config, scale, is_qat_checkpoint)
+        
+    Raises:
+        ValueError: If checkpoint is invalid
+    """
+    try:
+        checkpoint = torch.load(model_path, map_location='cpu')
+        # Extract state_dict from various possible locations
+        state_dict = checkpoint.get('params_ema', 
+                                  checkpoint.get('params', 
+                                  checkpoint.get('state_dict', {})))
+        
+        if not state_dict:
+            raise ValueError("Could not find a valid state_dict in the checkpoint.")
 
-    if not arch_config:
-        logger.warning("arch_config not found. Attempting to reconstruct from training args.")
-        # Fallback for neosr-style checkpoints
-        train_args = checkpoint.get('args', {})
-        if train_args:
-            arch_config = {
-                'in_chans': 3, 'embed_dim': train_args.get('embed_dim', 64),
-                'depths': train_args.get('depths', (3,3,3)),
-                'scale': train_args.get('scale', 2), 'mlp_ratio': 1.5,
-            }
-            logger.info("Reconstructed arch_config from training args.")
-        else:
-            raise ValueError("Checkpoint is missing 'arch_config' and 'args'. Cannot initialize model.")
+        arch_config = checkpoint.get('arch_config', None)
+        
+        # Detect QAT checkpoint by specific keys
+        is_qat_checkpoint = any(
+            'fake_quant' in k or 'activation_post_process' in k 
+            for k in state_dict.keys()
+        )
 
-    if isinstance(arch_config.get('depths'), list):
-        arch_config['depths'] = tuple(arch_config['depths'])
-    
-    scale = arch_config['scale']
-    return state_dict, arch_config, scale, is_qat_checkpoint
+        if not arch_config:
+            # Fallback for neosr-style checkpoints
+            train_args = checkpoint.get('args', {})
+            if train_args:
+                arch_config = {
+                    'in_chans': 3, 
+                    'embed_dim': train_args.get('embed_dim', 64),
+                    'depths': train_args.get('depths', (3, 3, 3)),
+                    'scale': train_args.get('scale', 2), 
+                    'mlp_ratio': 1.5,
+                }
+                logger.info("Reconstructed arch_config from training args.")
+            else:
+                raise ValueError("Checkpoint is missing 'arch_config' and 'args'")
+
+        if isinstance(arch_config.get('depths'), list):
+            arch_config['depths'] = tuple(arch_config['depths'])
+        
+        scale = arch_config['scale']
+        return state_dict, arch_config, scale, is_qat_checkpoint
+    except Exception as e:
+        raise ValueError(f"Checkpoint loading failed: {str(e)}")
+
 
 # ------------------- Main Execution ------------------- 
 if __name__ == '__main__':
@@ -322,11 +422,12 @@ if __name__ == '__main__':
     try:
         state_dict, arch_config, scale, is_qat_checkpoint = load_checkpoint(model_path)
         validation_images = list(Path(args.validation_dir).glob('*.[jp][pn]g'))
-        if not validation_images: raise FileNotFoundError("No validation images found.")
+        if not validation_images: 
+            raise FileNotFoundError("No validation images found in specified directory")
         validation_sample = load_image(validation_images[0])
         logger.info(f"Scale: {scale}x, QAT: {is_qat_checkpoint}, Validation sample: {validation_images[0].name}")
     except Exception as e:
-        logger.error(f"Checkpoint loading failed: {e}", exc_info=args.verbose)
+        logger.error(f"Checkpoint loading failed: {e}")
         sys.exit(1)
 
     # --- Phase 2: Initialize Base Model ---
@@ -351,7 +452,7 @@ if __name__ == '__main__':
         if not validate_pytorch_model(base_model, validation_sample, device):
             raise RuntimeError("Base model failed validation.")
     except Exception as e:
-        logger.error(f"Model initialization failed: {e}", exc_info=args.verbose)
+        logger.error(f"Model initialization failed: {e}")
         sys.exit(1)
 
     # --- Phase 3: Convert Models ---
@@ -363,7 +464,7 @@ if __name__ == '__main__':
     fp32_model = create_fp32_model(base_model, validation_sample, device)
     if fp32_model:
         fp32_path = output_dir / f"{model_stem}_fp32.pth"
-        torch.save(fp32_model.state_dict(), fp32_path)
+        save_optimized(fp32_model, str(fp32_path), 'fp32')
         logger.info(f"Saved FP32 model to: {fp32_path}")
         export_onnx_wrapper(fp32_model, scale, 'fp32', output_dir / f"{model_stem}_fp32.onnx", validation_sample)
     
@@ -373,7 +474,7 @@ if __name__ == '__main__':
         fp16_model = create_fp16_model(fp32_model, validation_sample, device)
         if fp16_model:
             fp16_path = output_dir / f"{model_stem}_fp16.pth"
-            torch.save(fp16_model.state_dict(), fp16_path)
+            save_optimized(fp16_model, str(fp16_path), 'fp16')
             logger.info(f"Saved FP16 model to: {fp16_path}")
             export_onnx_wrapper(fp16_model, scale, 'fp16', output_dir / f"{model_stem}_fp16.onnx", validation_sample)
     
@@ -383,10 +484,10 @@ if __name__ == '__main__':
         int8_model = create_int8_model(base_model, validation_sample, device)
         if int8_model:
             int8_path = output_dir / f"{model_stem}_int8.pth"
-            torch.save(int8_model.state_dict(), int8_path)
+            save_optimized(int8_model, str(int8_path), 'int8')
             logger.info(f"Saved INT8 model to: {int8_path}")
             export_onnx_wrapper(int8_model, scale, 'int8', output_dir / f"{model_stem}_int8.onnx", validation_sample)
-    elif not is_qat_checkpoint:
+    elif not is_qat_checkpoint and not args.skip_int8:
         logger.warning("\nSkipping INT8 conversion: The provided checkpoint is not from QAT.")
 
     # --- Phase 4: Final Report ---

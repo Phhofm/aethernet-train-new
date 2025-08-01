@@ -1,16 +1,16 @@
-name = "2xaether_tiny"
+name = "2xaether_extreme"
 model_type = "image"
 scale = 2
 use_amp = false
 bfloat16 = false
-fast_matmul = true
+fast_matmul = false
 
 [datasets.train]
 type = "paired"
 dataroot_gt = '/home/phips/Documents/dataset/PDM/OSISRD/v3/hr'
 dataroot_lq = '/home/phips/Documents/dataset/PDM/OSISRD/v3/x2'
 patch_size = 64
-batch_size = 8
+batch_size = 2
 
 [datasets.val]
 name = "val"
@@ -31,14 +31,16 @@ better = "lower"
 type = "calculate_topiq"
 
 [path]
-# pretrain_network_g = 'path/to/your/pretrained/model.pth' # no pretrain, from scratch
-strict_load_g = false # changed some code since 200k iters from scratch, this way i can auto resume still
+#pretrain_network_g = '/home/phips/Documents/GitHub/aethernet-train-new/neosr/experiments/2xaether_large/models/net_g_188717.pth'
+#strict_load_g = false
 
 [network_g]
-type = "aether_tiny"
+#type = "aether_tiny"
 #type = "aether_small"
 #type = "aether_medium"
 #type = "aether_large"
+#type = "aether_pro"
+type = "aether_extreme"
 
 [train]
 enable_qat = false # the non-qat pretrain, best quality and stability for training from scratch
@@ -47,7 +49,7 @@ ema = 0.999 # use this for fp32 pretrain
 
 [train.optim_g]
 type = "adamw"
-lr = 2e-4 # high learning rate for exploration phase. allows the model to take large steps, explore the vast loss landscape, and rapidly converge to a high-quality solution state
+lr = 1e-4
 betas = [ 0.9, 0.99 ]
 weight_decay = 0
 
@@ -55,6 +57,15 @@ weight_decay = 0
 type = "L1Loss"
 loss_weight = 1.0
 reduction = "mean"
+
+#[train.consistency_opt]
+#type = "consistency_loss"
+#loss_weight = 1.0
+
+[train.scheduler]
+type = "MultiStepLR"
+milestones = [ 400000, 600000, 800000, 900000 ]
+gamma = 0.5
 
 [logger]
 total_iter = 1000000

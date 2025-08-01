@@ -32,7 +32,6 @@ type = "calculate_topiq"
 
 [path]
 # pretrain_network_g = 'path/to/your/pretrained/model.pth' # no pretrain, from scratch
-strict_load_g = false # changed some code since 200k iters from scratch, this way i can auto resume still
 
 [network_g]
 type = "aether_tiny"

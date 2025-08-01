@@ -1,0 +1,119 @@
+name = "2xaether_tiny_real_nn2"
+model_type = "image"
+scale = 2
+use_amp = false
+bfloat16 = false
+fast_matmul = true
+
+[datasets.train]
+type = "paired"
+dataroot_gt = '/home/phips/Documents/dataset/PDM/OSISRD/v3/hr'
+dataroot_lq = '/home/phips/Documents/dataset/PDM/OSISRD/v3/x2_real_nn'
+patch_size = 32
+batch_size = 6
+
+[datasets.val]
+name = "val"
+type = "paired"
+dataroot_gt = '/home/phips/Documents/dataset/PDM/OSISRD/v3/validation/hr'
+dataroot_lq = '/home/phips/Documents/dataset/PDM/OSISRD/v3/validation/x2_real_nn'
+
+[val]
+val_freq = 5000
+[val.metrics.psnr]
+type = "calculate_psnr"
+[val.metrics.ssim]
+type = "calculate_ssim"
+[val.metrics.dists]
+type = "calculate_dists"
+better = "lower"
+[val.metrics.topiq]
+type = "calculate_topiq"
+
+[path]
+pretrain_network_g = '/home/phips/Documents/GitHub/aethernet-train/pretrains/2xaether_tiny/net_g_200000.pth'
+
+[network_g]
+type = "aether_tiny"
+#type = "aether_small"
+#type = "aether_medium"
+#type = "aether_large"
+
+[train]
+enable_qat = false # the non-qat pretrain, best quality and stability for training from scratch
+grad_clip = true # even in FP32, certain data patches can cause the loss to spike momentarily. This hepls protect against exploding gradients.
+ema = 0.999 # use this for fp32 pretrain
+
+[train.optim_g]
+type = "adan_sf"
+lr = 1e-3
+betas = [ 0.98, 0.92, 0.99 ]
+weight_decay = 0.01
+schedule_free = true
+warmup_steps = 1600
+
+[train.optim_d]
+type = "adan_sf"
+lr = 1e-4
+betas = [ 0.98, 0.92, 0.99 ]
+weight_decay = 0.01
+schedule_free = true
+warmup_steps = 600
+
+[network_d]
+type = "metagan"
+
+#  losses
+[train.mssim_opt]
+type = "mssim_loss"
+loss_weight = 1.0
+
+[train.consistency_opt]
+type = "consistency_loss"
+loss_weight = 1.0
+
+[train.ldl_opt]
+type = "ldl_loss"
+loss_weight = 1.0
+
+[train.fdl_opt]
+type = "fdl_loss"
+model = "dinov2" # "vgg", "resnet", "effnet"
+loss_weight = 0.5
+
+[train.gan_opt]
+type = "gan_loss"
+gan_type = "bce"
+loss_weight = 0.2
+
+#[train.msswd_opt]
+#type = "msswd_loss"
+#loss_weight = 1.0
+
+#[train.perceptual_opt]
+#type = "vgg_perceptual_loss"
+#loss_weight = 0.5
+#criterion = "huber"
+##patchloss = true
+##ipk = true
+##patch_weight = 1.0
+
+#[train.dists_opt]
+#type = "dists_loss"
+#loss_weight = 0.5
+
+#[train.ff_opt]
+#type = "ff_loss"
+#loss_weight = 0.35
+
+#[train.ncc_opt]
+#type = "ncc_loss"
+#loss_weight = 1.0
+
+#[train.kl_opt]
+#type = "kl_loss"
+#loss_weight = 1.0
+[logger]
+total_iter = 20000
+save_checkpoint_freq = 5000
+use_tb_logger = true
