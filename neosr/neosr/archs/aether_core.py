@@ -898,7 +898,7 @@ def aether_mobile(scale: int, **kwargs) -> AetherNet:
         use_channel_attn=False,
         use_spatial_attn=False,
         res_scale=0.2,
-        arch_option='aether_mobile'
+        arch_option='aether_mobile',
         **kwargs  # Pass through any other user-specified arguments
     )
 
