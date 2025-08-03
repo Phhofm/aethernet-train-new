@@ -1,0 +1,74 @@
+name = "2xaether_mobile_kd"
+model_type = "image"
+scale = 2
+use_amp = false
+bfloat16 = false
+fast_matmul = true
+
+[datasets.train]
+type = "paired"
+dataroot_gt = '/home/phips/Documents/dataset/PDM/OSISRD/v3/hr'
+dataroot_lq = '/home/phips/Documents/dataset/PDM/OSISRD/v3/x2'
+patch_size = 64
+batch_size = 8
+
+[datasets.val]
+name = "val"
+type = "paired"
+dataroot_gt = '/home/phips/Documents/dataset/PDM/OSISRD/v3/validation/hr'
+dataroot_lq = '/home/phips/Documents/dataset/PDM/OSISRD/v3/validation/x2'
+
+[val]
+val_freq = 5000
+[val.metrics.psnr]
+type = "calculate_psnr"
+[val.metrics.ssim]
+type = "calculate_ssim"
+[val.metrics.dists]
+type = "calculate_dists"
+better = "lower"
+[val.metrics.topiq]
+type = "calculate_topiq"
+
+[path]
+# pretrain_network_g = 'path/to/your/pretrained/model.pth' # no pretrain, from scratch
+#strict_load_g = false # changed some code since 200k iters from scratch, this way i can auto resume still
+
+# Path to the pre-trained TEACHER model
+pretrain_network_t = '/home/phips/Documents/GitHub/aethernet-train-new/neosr/experiments/2xaether_large/models/net_g_188717.pth' 
+strict_load_g = true
+
+[network_g]
+type = "aether_mobile"
+#type = "aether_tiny"
+#type = "aether_small"
+#type = "aether_medium"
+#type = "aether_large"
+
+[train]
+enable_qat = false # the non-qat pretrain, best quality and stability for training from scratch
+grad_clip = true # even in FP32, certain data patches can cause the loss to spike momentarily. This hepls protect against exploding gradients.
+ema = 0.999 # use this for fp32 pretrain
+
+[train.optim_g]
+type = "adamw"
+lr = 2e-4 # high learning rate for exploration phase. allows the model to take large steps, explore the vast loss landscape, and rapidly converge to a high-quality solution state
+betas = [ 0.9, 0.99 ]
+weight_decay = 0
+
+[train.pixel_opt]
+type = "L1Loss"
+loss_weight = 1.0
+reduction = "mean"
+
+[train.kd_opt]
+type = "KnowledgeDistillationLoss"
+loss_weight = 0.8       # Overall weight of the KD loss component
+feature_weight = 0.5    # Weight for feature map matching
+output_weight = 0.5     # Weight for final output matching
+criterion = "l1"
+
+[logger]
+total_iter = 1000000
+save_checkpoint_freq = 5000
+use_tb_logger = true

@@ -24,6 +24,22 @@ from neosr.utils.registry import MODEL_REGISTRY
 if TYPE_CHECKING:
     from torch.optim.optimizer import Optimizer
 
+class FeatureExtractor(torch.nn.Module):
+    def __init__(self, model, layer_name):
+        super().__init__()
+        self.model = model
+        self.layer_name = layer_name
+        self.features = []
+        # Find the actual module to hook
+        target_module = dict(self.model.named_modules())[self.layer_name]
+        self._hook_handle = target_module.register_forward_hook(self._hook_fn)
+
+    def _hook_fn(self, module, input, output):
+        self.features.append(output)
+
+    def remove(self):
+        self._hook_handle.remove()
+
 
 @MODEL_REGISTRY.register()
 class image(base):
@@ -32,68 +48,38 @@ class image(base):
     def __init__(self, opt: dict[str, Any]) -> None:
         super().__init__(opt)
 
-        # define network net_g
-        # smartly handle scale parameter so it is not redundantly in network options but only top scale config scale
-        # Make a mutable copy of the network options to avoid altering the original config dict
+        # smartly handle scale parameter... (your existing QoL code)
         network_g_opt = opt["network_g"].copy()
-
-        if "scale" not in network_g_opt:
-            # ...check if it exists at the top level of the configuration.
-            if "scale" in opt:
-                # Get the root logger to inform the user of this automatic action
-                logger = get_root_logger()
-                logger.info(
-                    f"Automatically passing top-level 'scale' ({opt['scale']}) to the network architecture."
-                )
-                # Add the scale to the network's options, so build_network receives it
-                network_g_opt["scale"] = opt["scale"]
-            else:
-                # If scale is nowhere to be found, the network will likely fail, so we should warn the user.
-                logger = get_root_logger()
-                logger.warning(
-                    "'scale' not found in [network_g] or top-level options. The network might fail to initialize if it requires 'scale'."
-                )
-
-        # Define the generator network using the (potentially modified) options
+        if "scale" not in network_g_opt and "scale" in opt:
+            network_g_opt["scale"] = opt["scale"]
+        
+        # Define the generator network (student)
         self.net_g = build_network(network_g_opt)
-        # --- END of Quality-of-Life modification ---
-        self.net_g = self.model_to_device(self.net_g)  # type: ignore[reportArgumentType,reportArgumentType,arg-type]
-        if self.opt["path"].get("print_network", False) is True:
-            self.print_network(self.net_g)
-
-        # custom qat integration
-        if self.opt.get('train', {}).get('enable_qat', False):
+        self.net_g = self.model_to_device(self.net_g)
+        self.print_network(self.net_g)
+        
+        # teacher model setup
+        self.teacher_g = None
+        load_path_teacher = self.opt["path"].get("pretrain_network_t", None)
+        if load_path_teacher is not None:
             logger = get_root_logger()
-            logger.info(f"{tc.light_cyan}Quantization-Aware Training (QAT) is enabled in config.{tc.end}")
-            if hasattr(self.net_g, 'prepare_qat'):
-                logger.info(f"{tc.light_cyan}Calling model.net_g.prepare_qat() to prepare the model for QAT...{tc.end}")
-                try:
-                    self.net_g.prepare_qat()
-                    logger.info(f"{tc.light_cyan}Model successfully prepared for QAT.{tc.end}")
-                except Exception as e:
-                    logger.error(f"{tc.red}Failed to prepare model for QAT: {e}{tc.end}")
-                    sys.exit(1)
-            else:
-                logger.warning(f"{tc.yellow}QAT enabled in config, but the model architecture has no 'prepare_qat' method.{tc.end}")
+            logger.info("[Knowledge Distillation] Loading teacher model.")
+            
+            # You can make 'teacher_type' a configurable option if you want to use other teachers
+            teacher_net_opt = {'type': 'aether_large', 'scale': self.opt['scale']}
+            self.teacher_g = build_network(teacher_net_opt)
+            # Use 'params_ema' for loading, as it usually holds the best weights
+            self.load_network(self.teacher_g, load_path_teacher, self.opt["path"].get("strict_load_g", True), 'params_ema')
+            self.teacher_g = self.model_to_device(self.teacher_g)
+            self.teacher_g.eval()
+            for param in self.teacher_g.parameters():
+                param.requires_grad = False
 
-        # define network net_d
-        self.net_d = self.opt.get("network_d", None)
-        if self.net_d is not None:
-            self.net_d = build_network(self.opt["network_d"])
-            self.net_d = self.model_to_device(self.net_d)  # type: ignore[reportArgumentType]
-            if self.opt.get("print_network", False) is True:
-                self.print_network(self.net_d)
-
-        # load pretrained g
+        # load pretrained g (student)
         load_path = self.opt["path"].get("pretrain_network_g", None)
-        if load_path is not None:
+        if load_path:
             param_key = self.opt["path"].get("param_key_g")
-            self.load_network(
-                self.net_g,
-                load_path,
-                param_key,
-                self.opt["path"].get("strict_load_g", True),
-            )
+            self.load_network(self.net_g, load_path, self.opt["path"].get("strict_load_g", True), param_key)
 
         # load pretrained d
         load_path = self.opt["path"].get("pretrain_network_d", None)
@@ -389,6 +375,17 @@ class image(base):
             logger.error(msg)
             sys.exit(1)
 
+        # kd loss
+        self.cri_kd = None
+        if self.opt['train'].get('kd_opt') and self.teacher_g:
+            kd_opt = self.opt['train']['kd_opt'].copy()
+            # Pass student and teacher channel info to the loss from the actual models
+            kd_opt['student_channels'] = self.net_g.embed_dim
+            kd_opt['teacher_channels'] = self.teacher_g.embed_dim
+            self.cri_kd = build_loss(kd_opt).to(self.device)
+            logger = get_root_logger()
+            logger.info(f"[Knowledge Distillation] KD loss initialized.")
+
     def setup_optimizers(self) -> None:
         train_opt = self.opt["train"]
         gradclip = self.opt["train"].get("grad_clip", True)
@@ -681,6 +678,137 @@ class image(base):
                 error_if_nonfinite=False,
             )
 
+        # ----------------------------------------------------
+        # --- FORWARD PASS AND LOSS CALCULATION ---
+        # ----------------------------------------------------
+
+        # Attach hook to student model to capture intermediate features
+        student_hook = FeatureExtractor(self.net_g, 'conv_before_upsample')
+        
+        # Forward pass for the student model
+        self.output = self.net_g(self.lq)
+        
+        # Get captured features and remove hook
+        student_features = student_hook.features
+        student_hook.remove()
+
+        l_g_total: Tensor = torch.zeros(1, device=self.device)
+        loss_dict = OrderedDict()
+
+        # pixel loss
+        if self.cri_pix:
+            l_g_pix = self.cri_pix(self.output, self.gt)
+            l_g_total += l_g_pix
+            loss_dict["l_g_pix"] = l_g_pix
+        # ssim loss
+        if self.cri_mssim:
+            l_g_mssim = self.cri_mssim(self.output, self.gt)
+            l_g_total += l_g_mssim
+            loss_dict["l_g_mssim"] = l_g_mssim
+        # ncc loss
+        if self.cri_ncc:
+            l_g_ncc = self.cri_ncc(self.output, self.gt)
+            l_g_total += l_g_ncc
+            loss_dict["l_g_ncc"] = l_g_ncc
+        # kl_div loss
+        if self.cri_kl:
+            l_g_kl = self.cri_kl(self.output, self.gt)
+            l_g_total += l_g_kl
+            loss_dict["l_g_kl"] = l_g_kl
+        # fdl perceptual loss
+        if self.cri_fdl:
+            l_g_fdl = self.cri_fdl(self.output, self.gt)
+            l_g_total += l_g_fdl
+            loss_dict["l_g_fdl"] = l_g_fdl
+        # consistency loss
+        if self.cri_consistency:
+            if self.match_lq_colors:
+                l_g_consistency = self.cri_consistency(self.output, self.lq_interp)
+            else:
+                l_g_consistency = self.cri_consistency(self.output, self.gt)
+            l_g_total += l_g_consistency
+            loss_dict["l_g_consistency"] = l_g_consistency
+        # msswd loss
+        if self.cri_msswd:
+            if self.match_lq_colors:
+                l_g_msswd = self.cri_msswd(self.output, self.lq_interp)
+            else:
+                l_g_msswd = self.cri_msswd(self.output, self.gt)
+            l_g_total += l_g_msswd
+            loss_dict["l_g_msswd"] = l_g_msswd
+        # perceptual loss
+        if self.cri_perceptual:
+            l_g_percep = self.cri_perceptual(self.output, self.gt)
+            l_g_total += l_g_percep
+            loss_dict["l_g_percep"] = l_g_percep
+        # dists loss
+        if self.cri_dists:
+            l_g_dists = self.cri_dists(self.output, self.gt)
+            l_g_total += l_g_dists
+            loss_dict["l_g_dists"] = l_g_dists
+        # ldl loss
+        if self.cri_ldl:
+            l_g_ldl = self.cri_ldl(self.output, self.gt)
+            l_g_total += l_g_ldl
+            loss_dict["l_g_ldl"] = l_g_ldl
+        # focal frequency loss
+        if self.cri_ff:
+            l_g_ff = self.cri_ff(self.output, self.gt)
+            l_g_total += l_g_ff
+            loss_dict["l_g_ff"] = l_g_ff
+        # gan loss
+        if self.cri_gan:
+            # switch to eval mode
+            self.net_d.eval()
+            with torch.inference_mode():
+                fake_g_pred = self.net_d(self.output)  # type: ignore[reportCallIssue,reportOptionalCall]
+            l_g_gan = self.cri_gan(fake_g_pred, target_is_real=True, is_disc=False)
+            l_g_total += l_g_gan
+            loss_dict["l_g_gan"] = l_g_gan
+            # switch to train mode
+            self.net_d.train()
+
+        # 2. Knowledge Distillation loss (Student vs. Teacher)
+        if self.teacher_g and self.cri_kd:
+            with torch.no_grad():
+                # Attach hook for teacher and get its outputs/features
+                teacher_hook = FeatureExtractor(self.teacher_g, 'conv_before_upsample')
+                teacher_output = self.teacher_g(self.lq)
+                teacher_features = teacher_hook.features
+                teacher_hook.remove()
+            
+            # Calculate the distillation loss
+            l_g_kd = self.cri_kd(self.output, teacher_output, student_features, teacher_features)
+            l_g_total += l_g_kd
+            loss_dict['l_g_kd'] = l_g_kd
+
+        # 3. GAN loss (Student vs. Discriminator)
+        if self.cri_gan:
+            self.net_g.eval() # switch to eval mode
+            fake_g_pred = self.net_d(self.output)
+            self.net_g.train() # switch back to train mode
+            l_g_gan = self.cri_gan(fake_g_pred, target_is_real=True, is_disc=False)
+            l_g_total += l_g_gan
+            loss_dict['l_g_gan'] = l_g_gan
+        
+        # Divide losses by accumulation factor
+        l_g_total = l_g_total / self.accum_iters
+
+        # ----------------------------------------------------
+        # --- BACKWARD AND DISCRIMINATOR OPTIMIZATION ---
+        # ----------------------------------------------------
+
+        if self.use_amp:
+            self.gradscaler_g.scale(l_g_total).backward()
+        else:
+            l_g_total.backward()
+
+        if self.gradclip and self.use_amp:
+            self.gradscaler_g.unscale_(self.optimizer_g)
+            torch.nn.utils.clip_grad_norm_(self.net_g.parameters(), 1)
+        elif self.gradclip:
+            torch.nn.utils.clip_grad_norm_(self.net_g.parameters(), 1)
+
         # optimize net_d
         if self.net_d is not None:
             for p in self.net_d.parameters():  # type: ignore[reportAttributeAccessIssue,attr-defined]
@@ -738,6 +866,45 @@ class image(base):
                     else:
                         self.gradscaler_d.scale(l_d_real).backward()  # type: ignore[reportFunctionMemberAccess,attr-defined]
                         self.gradscaler_d.scale(l_d_fake).backward()  # type: ignore[reportFunctionMemberAccess,attr-defined]
+
+                    for p in self.net_d.parameters():
+                        p.requires_grad = True
+                    
+                    if (self.n_accumulated) % self.accum_iters == 0:
+                        self.optimizer_d.zero_grad()
+                        
+                    # real
+                    real_d_pred = self.net_d(self.gt)
+                    l_d_real = self.cri_gan(real_d_pred, True, is_disc=True) / self.accum_iters
+                    loss_dict['l_d_real'] = l_d_real
+                    loss_dict['out_d_real'] = torch.mean(real_d_pred.detach())
+
+                    # fake
+                    fake_d_pred = self.net_d(self.output.detach())
+                    l_d_fake = self.cri_gan(fake_d_pred, False, is_disc=True) / self.accum_iters
+                    loss_dict['l_d_fake'] = l_d_fake
+                    loss_dict['out_d_fake'] = torch.mean(fake_d_pred.detach())
+
+                    if self.use_amp:
+                        self.gradscaler_d.scale(l_d_real).backward()
+                        self.gradscaler_d.scale(l_d_fake).backward()
+                    else:
+                        l_d_real.backward()
+                        l_d_fake.backward()
+                    
+                    if self.gradclip:
+                        if self.use_amp:
+                            self.gradscaler_d.unscale_(self.optimizer_d)
+                        torch.nn.utils.clip_grad_norm_(self.net_d.parameters(), 1)
+
+                # error if NaN
+                if torch.isnan(l_g_total).any():
+                    raise RuntimeError("NaN found in generator loss.")
+                
+                self.log_dict = self.reduce_loss_dict(loss_dict)
+
+                # return generator loss
+                return l_g_total
 
             # clip discriminator
             if (
