@@ -1,0 +1,68 @@
+name = "2xaether_large_qat"
+model_type = "image"
+scale = 2
+use_amp = false
+bfloat16 = false
+fast_matmul = false
+
+[datasets.train]
+type = "paired"
+dataroot_gt = '/home/phips/Documents/dataset/PDM/OSISRD/v3/hr'
+dataroot_lq = '/home/phips/Documents/dataset/PDM/OSISRD/v3/x2'
+patch_size = 64
+batch_size = 6
+
+[datasets.val]
+name = "val"
+type = "paired"
+dataroot_gt = '/home/phips/Documents/dataset/PDM/OSISRD/v3/validation/hr'
+dataroot_lq = '/home/phips/Documents/dataset/PDM/OSISRD/v3/validation/x2'
+
+[val]
+val_freq = 5000
+[val.metrics.psnr]
+type = "calculate_psnr"
+[val.metrics.ssim]
+type = "calculate_ssim"
+[val.metrics.dists]
+type = "calculate_dists"
+better = "lower"
+[val.metrics.topiq]
+type = "calculate_topiq"
+
+[path]
+pretrain_network_g = '/home/phips/Documents/GitHub/aethernet-train-new/neosr/experiments/2xaether_large/models/net_g_188717.pth'
+strict_load_g = false
+
+[network_g]
+#type = "aether_tiny"
+#type = "aether_small"
+#type = "aether_medium"
+type = "aether_large"
+
+[train]
+enable_qat = true
+ema = 0.999
+grad_clip = true # even in FP32, certain data patches can cause the loss to spike momentarily. This hepls protect against exploding gradients.
+
+[train.optim_g]
+type = "adan_sf"
+lr = 1e-3
+betas = [ 0.98, 0.92, 0.99 ]
+weight_decay = 0.01
+schedule_free = true
+warmup_steps = 1600
+
+[train.pixel_opt]
+type = "L1Loss"
+loss_weight = 1.0
+reduction = "mean"
+
+[train.consistency_opt]
+type = "consistency_loss"
+loss_weight = 1.0
+
+[logger]
+total_iter = 1000000
+save_checkpoint_freq = 5000
+use_tb_logger = true

@@ -106,12 +106,21 @@ class image(base):
         # Check if QAT is enabled in the training options
         is_qat_enabled = self.opt.get('train', {}).get('enable_qat', False)
 
+        if is_qat_enabled:
+
+            # Prepare the generator for QAT
+            self.net_g.prepare_qat()
+            logger.info("Generator has been prepared for Quantization-Aware Training.")
+
+            #print("--- QAT MODEL ARCHITECTURE ---")
+            #print(self.net_g)
+
+
         if self.ema > 0:
             if is_qat_enabled:
-                logger.warning(
-                    f"{tc.light_yellow}QAT is enabled. Disabling EMA as they are currently incompatible.{tc.end}"
-                )
-                self.ema = -1 # Explicitly disable EMA
+                self.ema_decay = -1 # Explicitly disable EMA
+                logger.info("EMA has been disabled as it is incompatible with QAT.")
+                
             else:
                 logger.info("Using exponential-moving average.")
                 # Define a safe EMA averaging function that will be applied per-parameter
@@ -971,10 +980,12 @@ class image(base):
             if self.net_d is not None:
                 self.optimizer_d.zero_grad(set_to_none=True)
 
-            if self.ema > 0:
-                self.net_g_ema.update_parameters(self.net_g)  # type: ignore[reportArgumentType,arg-type]
-                if self.net_d is not None:
-                    self.net_d_ema.update_parameters(self.net_d)  # type: ignore[reportArgumentType,arg-type]
+            # ema
+            if self.ema_decay > 0:
+                if hasattr(self, 'net_g_ema'):
+                    self.net_g_ema.update_parameters(self.net_g)
+                if self.net_d and hasattr(self, 'net_d_ema'):
+                    self.net_d_ema.update_parameters(self.net_d)
 
     def tile_val(self) -> Tensor:
         b, c, h, w = self.lq.shape
@@ -1197,10 +1208,12 @@ class image(base):
 
     def save(self, epoch: int, current_iter: int) -> None:
         """Save networks and training state."""
-        if self.ema > 0:
-            self.save_network(self.net_g_ema, "net_g", current_iter)
-        else:
-            self.save_network(self.net_g, "net_g", current_iter)
+        if self.ema_decay > 0:
+            # Check if the EMA model object exists before trying to save it
+            if hasattr(self, 'net_g_ema'):
+                self.save_network(self.net_g_ema, "net_g", current_iter, param_key="params_ema")
+            if self.net_d and hasattr(self, 'net_d_ema'):
+                self.save_network(self.net_d_ema, "net_d", current_iter, param_key="params_ema")
 
         if self.net_d is not None:
             if self.ema > 0:

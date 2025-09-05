@@ -31,7 +31,7 @@ better = "lower"
 type = "calculate_topiq"
 
 [path]
-pretrain_network_g = '/home/phips/Documents/GitHub/aethernet-train/neosr/experiments/2xaether_tiny/models/net_g_210000.pth' # we are using the fp32 non-qat pretrain for qat training
+pretrain_network_g = '/home/phips/Documents/GitHub/aethernet-train-new/neosr/experiments/2xaether_tiny/models/net_g_240000.pth' # we are using the fp32 non-qat pretrain for qat training
 strict_load_g = false # The previous non-qat fp32 model will have missing keys, unexpected keys and unexpected buffers. This is fine though.
 
 [network_g]
@@ -46,7 +46,7 @@ grad_clip = true # qat can amplify small numerical errors because of integer qua
 
 [train.optim_g]
 type = "adamw"
-lr = 5e-6 # adaptation, not exploration. We already found optimal state, we want smallest possible adjustments (survive the "stress" of 8-bit quantization) without losing the pretrain quality. We are no longer looking for steep validation metrics climb, we are looking for stability and preservation of quality. A flat, high-psnr graph is success.Therefore way lower learning rate, it should start with similiar val metrics like the pretrain we gave it. 
+lr = 2e-4
 betas = [ 0.9, 0.99 ]
 weight_decay = 0
 
